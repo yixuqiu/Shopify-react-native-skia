@@ -1,0 +1,191 @@
+// @ts-check
+// Note: type annotations allow type checking and IDEs autocompletion
+
+import { themes } from "prism-react-renderer";
+
+/** @type {import('@docusaurus/types').Config} */
+const config = {
+  title: "React Native Skia",
+  tagline: "High Performance 2D Graphics",
+  url: "https://wcandillon.github.io/",
+  baseUrl: "/react-native-skia/",
+  onBrokenLinks: "throw",
+  onBrokenMarkdownLinks: "throw",
+  onBrokenAnchors: "throw",
+  favicon: "img/favicon.ico",
+  organizationName: "wcandillon", // Usually your GitHub org/user name.
+  projectName: "react-native-skia", // Usually your repo name.
+  // scripts: [{ src: "https://snack.expo.dev/embed.js", async: true }],
+  // plugins: [
+  //   (context, options) => {
+  //     return {
+  //       name: 'my-plugin',
+  //       async loadContent() {
+  //         // ...
+  //       },
+  //       async contentLoaded({ content, actions }) {
+  //         console.log({ content, actions });
+  //       },
+  //       async injectHtmlTags({ content }) {
+  //         console.log({ content });
+  //       },
+  //       async postBuild({siteConfig, routesPaths, outDir}) {
+  //         console.log({siteConfig, routesPaths, outDir});
+  //       }
+  //     };
+  //   },
+  // ],
+  presets: [
+    [
+      "@docusaurus/preset-classic",
+      /** @type {import('@docusaurus/preset-classic').Options} */
+      ({
+        docs: {
+          sidebarPath: require.resolve("./sidebars.js"),
+          // Please change this to your repo.
+          editUrl:
+            "https://github.com/wcandillon/react-native-skia/edit/main/apps/docs/",
+        },
+        // blog: {
+        //   showReadingTime: true,
+        //   // Please change this to your repo.
+        //   editUrl:
+        //     "https://github.com/facebook/docusaurus/edit/main/website/blog/",
+        // },
+        theme: {
+          customCss: require.resolve("./src/css/custom.css"),
+        },
+      }),
+    ],
+    // [
+    //   "docusaurus-preset-shiki-twoslash",
+    //   {
+    //     themes: ["min-light", "nord"],
+    //   },
+    // ],
+  ],
+
+  themeConfig:
+    /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
+    ({
+      algolia: {
+        appId: "LFNAM0RNW3",
+        apiKey: "52424a97bf8bfa39b690587e466e0fec",
+        indexName: "react-native-skia",
+        contextualSearch: false,
+      },
+      metadata: [
+        { name: "algolia-site-verification", content: "120C18B37B56CF72" },
+      ],
+      announcementBar: {
+        id: "v3",
+        content:
+          'React Native Skia v3 is out, powered by Skia Graphite. Read the <a href="/react-native-skia/docs/getting-started/migration">migration guide</a>, or go to the <a href="/react-native-skia/v2/">v2 documentation</a>.',
+        isCloseable: true,
+      },
+      navbar: {
+        title: "React Native Skia",
+        logo: {
+          alt: "React Native Skia",
+          src: "/react-native-skia/img/logo.png",
+        },
+        items: [
+          {
+            type: "doc",
+            docId: "getting-started/installation",
+            position: "left",
+            label: "Docs",
+          },
+          // {to: '/blog', label: 'Blog', position: 'left'},
+          {
+            type: "dropdown",
+            label: "latest",
+            position: "right",
+            items: [
+              {
+                label: "latest (v3)",
+                to: "/docs/getting-started/installation",
+              },
+              {
+                // Frozen v2 build, deployed from the docs-v2 branch
+                label: "v2",
+                to: "pathname:///react-native-skia/v2/",
+                target: "_self",
+              },
+            ],
+          },
+          {
+            label: "GitHub",
+            href: "https://github.com/wcandillon/react-native-skia",
+            position: "right",
+          },
+        ],
+      },
+      footer: {
+        style: "dark",
+        links: [
+          {
+            title: "Resources",
+            items: [
+              {
+                label: "Documentation",
+                to: "/docs/getting-started/installation",
+              },
+              {
+                label: "Migrating to v3",
+                to: "/docs/getting-started/migration",
+              },
+              {
+                // Frozen v2 build, deployed from the docs-v2 branch
+                label: "v2 Documentation",
+                to: "pathname:///react-native-skia/v2/",
+                target: "_self",
+              },
+            ],
+          },
+          // {
+          //   title: 'Community',
+          //   items: [
+          //     {
+          //       label: 'Stack Overflow',
+          //       href: 'https://stackoverflow.com/questions/tagged/docusaurus',
+          //     },
+          //     {
+          //       label: 'Discord',
+          //       href: 'https://discordapp.com/invite/docusaurus',
+          //     },
+          //     {
+          //       label: 'Twitter',
+          //       href: 'https://twitter.com/docusaurus',
+          //     },
+          //   ],
+          // },
+          {
+            title: "More",
+            items: [
+              // {
+              //   label: "Blog",
+              //   to: "/blog",
+              // },
+              {
+                label: "GitHub",
+                href: "https://github.com/wcandillon/react-native-skia",
+              },
+              {
+                label: "React Native WebGPU",
+                href: "https://github.com/wcandillon/react-native-webgpu",
+              },
+            ],
+          },
+        ],
+        copyright: `Copyright © 2026-present William Candillon. Copyright © 2021-2026 Shopify Inc. Built with Docusaurus.`,
+      },
+      prism: {
+        //theme: themes.jettwaveLight,
+        theme: themes.oneLight,
+        darkTheme: themes.vsDark,
+      },
+    }),
+};
+
+module.exports = config;

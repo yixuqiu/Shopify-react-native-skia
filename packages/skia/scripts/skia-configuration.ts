@@ -1,0 +1,604 @@
+import fs from "fs";
+import { execSync } from "child_process";
+import path from "path";
+
+import { $, fileOps } from "./utils";
+
+const DEBUG = false;
+const BUILD_WITH_PARAGRAPH = true;
+
+export const SkiaSrc = path.join(__dirname, "../../../externals/skia");
+export const ProjectRoot = path.join(__dirname, "../../..");
+export const PackageRoot = path.join(__dirname, "..");
+export const OutFolder = path.join(SkiaSrc, DEBUG ? "debug" : "out");
+
+const NdkDir = process.env.ANDROID_NDK ?? "";
+
+const NoParagraphArgs = [
+  ["skia_use_harfbuzz", false],
+  ["skia_use_icu", false],
+];
+
+// To build the paragraph API:
+// On Android: we use system ICU
+// On Apple: we use libgrapheme
+const CommonParagraphArgs = [
+  ["skia_enable_skparagraph", true],
+  ["skia_use_system_icu", false],
+  ["skia_use_harfbuzz", true],
+  ["skia_use_system_harfbuzz", false],
+];
+const ParagraphArgsAndroid = BUILD_WITH_PARAGRAPH
+  ? [
+      ...CommonParagraphArgs,
+      ["skia_use_icu", true],
+      ["skia_use_runtime_icu", true],
+    ]
+  : NoParagraphArgs;
+
+const ParagraphArgsApple = BUILD_WITH_PARAGRAPH
+  ? [
+      ...CommonParagraphArgs,
+      ["skia_use_icu", false],
+      ["skia_use_client_icu", false],
+      ["skia_use_libgrapheme", true],
+    ]
+  : NoParagraphArgs;
+
+const ParagraphApple = BUILD_WITH_PARAGRAPH
+  ? ["libskparagraph.a", "libskunicode_core.a", "libskunicode_libgrapheme.a"]
+  : [];
+
+const ParagraphOutputsAndroid = BUILD_WITH_PARAGRAPH
+  ? ["libskparagraph.a", "libskunicode_core.a", "libskunicode_icu.a"]
+  : [];
+
+// Dawn is not taken from the GN build: skia_use_dawn makes it build Dawn's
+// non-monolithic libdawn_combined.a as a dependency of the Graphite sources,
+// but what ships is the monolithic libwebgpu_dawn that build-dawn.ts builds
+// from the same checkout.
+
+export const commonArgs = [
+  // No RAW codec: React Native apps do not decode camera RAW files through
+  // Skia, CanvasKit never shipped it, and SkRawCodec was the one Skia source
+  // built with exceptions.
+  ["skia_use_dng_sdk", false],
+  ["skia_use_piex", false],
+  ["skia_use_system_expat", false],
+  ["skia_use_system_libjpeg_turbo", false],
+  ["skia_use_system_libpng", false],
+  ["skia_use_system_libwebp", false],
+  ["skia_use_system_zlib", false],
+  ["skia_enable_tools", false],
+  ["is_official_build", !DEBUG],
+  ["skia_enable_skottie", true],
+  ["is_debug", DEBUG],
+  ["skia_enable_pdf", false],
+  ["paragraph_tests_enabled", false],
+  ["is_component_build", false],
+  ["skia_enable_graphite", true],
+  ["skia_use_dawn", true],
+  // m152 turns PartitionAlloc on by default for clang builds, which leaves
+  // raw_ptr/PartitionAddressSpace symbols undefined when linking against the
+  // prebuilt libskia.a (the allocator lives in its own target we don't ship).
+  // Skia's noop raw_ptr shims are used instead.
+  ["skia_use_partition_alloc", false],
+  // C++20 is required for Graphite builds (Dawn uses C++20 concepts)
+  // Passed via extra_cflags_cc per-target instead of skia_use_cpp20 (not available in all Skia versions)
+];
+
+export type PlatformName =
+  "apple-ios" | "apple-tvos" | "apple-macos" | "android";
+
+export type ApplePlatformName = Extract<PlatformName, `apple-${string}`>;
+
+export const isApplePlatform = (
+  name: PlatformName
+): name is ApplePlatformName => name.startsWith("apple-");
+
+type Arg = (string | boolean | number)[];
+export type Target = {
+  args?: Arg[];
+  cpu: string;
+  platform?: string;
+  options?: Arg[];
+};
+
+type AndroidTarget = Target & {
+  output: string;
+};
+
+export type Platform<PlatformTarget extends Target = Target> = {
+  targets: { [key: string]: PlatformTarget };
+  args: Arg[];
+  outputRoot: string;
+  outputNames: string[];
+  options?: Arg[];
+};
+
+// Deployment targets of the binaries.
+// Each target has separate GN args; ios_min_target also carries tvOS/macOS minima.
+const iosMinTarget = "15.1";
+const tvosMinTarget = "15.1";
+const macosMinTarget = "11.0";
+
+// Common Apple build arguments shared across all Apple platforms
+const appleCommonArgs: Arg[] = [
+  ["skia_use_metal", true],
+  ["skia_use_gl", false],
+  ["cc", '"clang"'],
+  ["cxx", '"clang++"'],
+  ...ParagraphArgsApple,
+];
+
+// Common Apple output names shared across all Apple platforms
+const appleOutputNames = [
+  "libskia.a",
+  "libskshaper.a",
+  "libsvg.a",
+  "libskottie.a",
+  "libsksg.a",
+  ...ParagraphApple,
+];
+
+export const configurations: { android: Platform<AndroidTarget> } & Record<
+  ApplePlatformName,
+  Platform
+> = {
+  "android": {
+    targets: {
+      arm: {
+        platform: "android",
+        cpu: "arm",
+        output: "armeabi-v7a",
+      },
+      arm64: {
+        platform: "android",
+        cpu: "arm64",
+        output: "arm64-v8a",
+      },
+      x86: {
+        platform: "android",
+        cpu: "x86",
+        output: "x86",
+      },
+      x64: {
+        platform: "android",
+        cpu: "x64",
+        output: "x86_64",
+      },
+    },
+    args: [
+      ["ndk_api", 26],
+      ["ndk", `"${NdkDir}"`],
+      ["skia_use_system_freetype2", false],
+      ["skia_use_gl", false],
+      ["cc", '"clang"'],
+      ["cxx", '"clang++"'],
+      [
+        "extra_cflags",
+        `["-DSKIA_C_DLL", "-DHAVE_SYSCALL_GETRANDOM", "-DXML_DEV_URANDOM"]`,
+      ],
+      // RTTI, as on the Apple targets. Without it, a source built with
+      // exceptions gets its own copies of the C++ runtime's exception typeinfo
+      // (SkRawCodec did, before the RAW codec was dropped); build-skia.ts
+      // rejects an archive that defines one.
+      ["extra_cflags_cc", `["-frtti"]`],
+      ...ParagraphArgsAndroid,
+    ],
+    outputRoot: "libs/android",
+    outputNames: [
+      "libskia.a",
+      "libskshaper.a",
+      "libsvg.a",
+      "libskottie.a",
+      "libsksg.a",
+      "libjsonreader.a",
+      ...ParagraphOutputsAndroid,
+    ],
+  },
+  "apple-ios": {
+    targets: {
+      "arm64-iphoneos": {
+        cpu: "arm64",
+        platform: "ios",
+        args: [
+          ["ios_min_target", `"${iosMinTarget}"`],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+      "arm64-iphonesimulator": {
+        cpu: "arm64",
+        platform: "ios",
+        args: [
+          ["ios_min_target", `"${iosMinTarget}"`],
+          ["ios_use_simulator", true],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+      "x64-iphonesimulator": {
+        cpu: "x64",
+        platform: "ios",
+        args: [
+          ["ios_min_target", `"${iosMinTarget}"`],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+      "arm64-maccatalyst": {
+        cpu: "arm64",
+        platform: "mac",
+        args: [
+          ["target_environment", '"catalyst"'],
+          ["ios_min_target", `"${iosMinTarget}"`],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+      "x64-maccatalyst": {
+        cpu: "x64",
+        platform: "mac",
+        args: [
+          ["target_environment", '"catalyst"'],
+          ["ios_min_target", `"${iosMinTarget}"`],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+    },
+    args: appleCommonArgs,
+    outputRoot: "libs/ios",
+    outputNames: appleOutputNames,
+  },
+  "apple-tvos": {
+    targets: {
+      "arm64-tvos": {
+        cpu: "arm64",
+        platform: "tvos",
+        args: [
+          ["ios_min_target", `"${tvosMinTarget}"`],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+      "arm64-tvsimulator": {
+        cpu: "arm64",
+        platform: "tvos",
+        args: [
+          ["ios_min_target", `"${tvosMinTarget}"`],
+          ["ios_use_simulator", true],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+      "x64-tvsimulator": {
+        cpu: "x64",
+        platform: "tvos",
+        args: [
+          ["ios_min_target", `"${tvosMinTarget}"`],
+          ["ios_use_simulator", true],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+    },
+    args: appleCommonArgs,
+    outputRoot: "libs/tvos",
+    outputNames: appleOutputNames,
+  },
+  "apple-macos": {
+    targets: {
+      "arm64-macosx": {
+        cpu: "arm64",
+        platform: "mac",
+        args: [
+          ["ios_min_target", `"${macosMinTarget}"`],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+      "x64-macosx": {
+        cpu: "x64",
+        platform: "mac",
+        args: [
+          ["ios_min_target", `"${macosMinTarget}"`],
+          ["extra_cflags_cc", `["-fexceptions", "-frtti"]`],
+        ],
+      },
+    },
+    args: appleCommonArgs,
+    outputRoot: "libs/macos",
+    outputNames: appleOutputNames,
+  },
+};
+
+const copyModule = (module: string) => {
+  const destDir = `./cpp/skia/modules/${module}/include`;
+  const srcDir = `../../externals/skia/modules/${module}/include`;
+  fileOps.mkdir(destDir);
+  fileOps.cp(srcDir, destDir);
+};
+
+// Dawn headers: from the Dawn built locally with `yarn build-dawn` when there is
+// one (it is what the native builds then link), otherwise from the
+// react-native-webgpu-dawn package, the same way Gradle and the podspec pick the
+// library.
+const resolveDawnInclude = () => {
+  const localDawnInclude = path.join(PackageRoot, "libs", "dawn", "include");
+  if (fs.existsSync(path.join(localDawnInclude, "webgpu", "webgpu.h"))) {
+    console.log(
+      "   📦 Copying Dawn headers from the local build (libs/dawn)..."
+    );
+    return localDawnInclude;
+  }
+  let dawnPackage: string;
+  try {
+    dawnPackage = path.dirname(
+      require.resolve("react-native-webgpu-dawn/package.json")
+    );
+  } catch (e) {
+    throw new Error(
+      "No Dawn headers found: install dependencies (react-native-webgpu-dawn) or build Dawn locally with `yarn build-dawn`"
+    );
+  }
+  console.log(`   📦 Copying Dawn headers from ${dawnPackage}...`);
+  return path.join(dawnPackage, "include");
+};
+
+export const copyHeaders = () => {
+  console.log("⚙️ Copying Skia headers...");
+  process.chdir(PackageRoot);
+
+  // Sources first: a run that cannot copy leaves the current headers in place.
+  if (!fs.existsSync("../../externals/skia/include")) {
+    throw new Error(
+      "No Skia headers found in externals/skia: check out the submodules with `git submodule update --init --recursive`"
+    );
+  }
+  const dawnInclude = resolveDawnInclude();
+
+  console.log("   Cleaning up existing directories...");
+  fileOps.rm("./cpp/skia");
+  fileOps.rm("./cpp/dawn");
+
+  console.log("   Creating base directories...");
+  fileOps.mkdir("./cpp/skia/include");
+  fileOps.mkdir("./cpp/skia/modules");
+  fileOps.mkdir("./cpp/skia/src");
+
+  // Graphite source headers the wrapper needs beyond Skia's public include/.
+  console.log("   Copying Graphite source headers...");
+  fileOps.mkdir("./cpp/skia/src/gpu/graphite");
+  for (const header of [
+    "ContextOptionsPriv.h",
+    "ResourceTypes.h",
+    "TextureProxyView.h",
+  ]) {
+    fileOps.cp(
+      `../../externals/skia/src/gpu/graphite/${header}`,
+      `./cpp/skia/src/gpu/graphite/${header}`
+    );
+  }
+
+  {
+    fileOps.mkdir("./cpp/dawn/include");
+    fileOps.cp(path.join(dawnInclude, "dawn"), "./cpp/dawn/include/dawn");
+    fileOps.cp(path.join(dawnInclude, "webgpu"), "./cpp/dawn/include/webgpu");
+
+    // Dawn ships the generated webgpu.h and webgpu_cpp.h under dawn/ and
+    // forwarding shims under webgpu/. Xcode's header maps resolve by basename,
+    // so keep one file per name: the generated headers move to webgpu/, which
+    // is where the sources include them from.
+    fileOps.rm("./cpp/dawn/include/dawn/wire");
+    fileOps.sed(
+      "./cpp/dawn/include/dawn/dawn_proc_table.h",
+      /#include "dawn\/webgpu\.h"/g,
+      '#include "webgpu/webgpu.h"'
+    );
+    for (const header of ["webgpu.h", "webgpu_cpp.h"]) {
+      fileOps.rm(`./cpp/dawn/include/webgpu/${header}`);
+      fileOps.cp(
+        `./cpp/dawn/include/dawn/${header}`,
+        `./cpp/dawn/include/webgpu/${header}`
+      );
+      fileOps.rm(`./cpp/dawn/include/dawn/${header}`);
+    }
+    fileOps.rm("./cpp/dawn/include/webgpu/webgpu_cpp_print.h");
+    console.log("      ✓ Dawn headers copied");
+  }
+
+  console.log("   Copying main include directory...");
+  // Copy main include directory
+  fileOps.cp("../../externals/skia/include", "./cpp/skia/include");
+
+  console.log("   Copying Skia modules...");
+  // Copy modules
+  copyModule("svg");
+  copyModule("skresources");
+  copyModule("skparagraph");
+  copyModule("skshaper");
+  copyModule("skottie");
+  copyModule("sksg");
+
+  console.log("   Copying jsonreader module...");
+  // Copy jsonreader module
+  fileOps.rm("./cpp/skia/modules/jsonreader");
+  fileOps.cp(
+    "../../externals/skia/modules/jsonreader",
+    "./cpp/skia/modules/jsonreader"
+  );
+
+  console.log("   Copying skottie source files...");
+  // Copy skottie src files
+  fileOps.rm("./cpp/skia/modules/skottie/src");
+  fileOps.mkdir("./cpp/skia/modules/skottie/src");
+  fileOps.mkdir("./cpp/skia/modules/skottie/src/text");
+  fileOps.mkdir("./cpp/skia/modules/skottie/src/animator");
+  fileOps.cp(
+    "../../externals/skia/modules/skottie/src/SkottieValue.h",
+    "./cpp/skia/modules/skottie/src/SkottieValue.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/modules/skottie/src/text/TextAdapter.h",
+    "./cpp/skia/modules/skottie/src/text/TextAdapter.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/modules/skottie/src/text/Font.h",
+    "./cpp/skia/modules/skottie/src/text/Font.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/modules/skottie/src/text/TextAnimator.h",
+    "./cpp/skia/modules/skottie/src/text/TextAnimator.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/modules/skottie/src/text/TextValue.h",
+    "./cpp/skia/modules/skottie/src/text/TextValue.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/modules/skottie/src/animator/Animator.h",
+    "./cpp/skia/modules/skottie/src/animator/Animator.h"
+  );
+
+  console.log("   Copying skcms module...");
+  // Copy skcms module
+  fileOps.cp("../../externals/skia/modules/skcms", "./cpp/skia/modules/skcms");
+
+  console.log("   Copying src/core files...");
+  // Copy src/core files
+  fileOps.mkdir("./cpp/skia/src/");
+  fileOps.mkdir("./cpp/skia/src/core/");
+  fileOps.cp(
+    "../../externals/skia/src/core/SkChecksum.h",
+    "./cpp/skia/src/core/SkChecksum.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/src/core/SkTHash.h",
+    "./cpp/skia/src/core/SkTHash.h"
+  );
+
+  fileOps.cp(
+    "../../externals/skia/src/core/SkLRUCache.h",
+    "./cpp/skia/src/core/SkLRUCache.h"
+  );
+
+  console.log("✅ Skia headers copied successfully");
+
+  // These used to live in src/base; they were folded into src/core in m152.
+  fileOps.cp(
+    "../../externals/skia/src/core/SkTLazy.h",
+    "./cpp/skia/src/core/SkTLazy.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/src/core/SkMathPriv.h",
+    "./cpp/skia/src/core/SkMathPriv.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/src/core/SkTInternalLList.h",
+    "./cpp/skia/src/core/SkTInternalLList.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/src/core/SkUTF.h",
+    "./cpp/skia/src/core/SkUTF.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/src/core/SkArenaAlloc.h",
+    "./cpp/skia/src/core/SkArenaAlloc.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/src/core/SkAutoLocaleSetter.h",
+    "./cpp/skia/src/core/SkAutoLocaleSetter.h"
+  );
+
+  // Copy skunicode
+  fileOps.mkdir("./cpp/skia/modules/skunicode/include/");
+  fileOps.cp(
+    "../../externals/skia/modules/skunicode/include/SkUnicode.h",
+    "./cpp/skia/modules/skunicode/include/SkUnicode.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/modules/skunicode/include/SkUnicode_libgrapheme.h",
+    "./cpp/skia/modules/skunicode/include/SkUnicode_libgrapheme.h"
+  );
+  fileOps.cp(
+    "../../externals/skia/modules/skunicode/include/SkUnicode_icu.h",
+    "./cpp/skia/modules/skunicode/include/SkUnicode_icu.h"
+  );
+  // Check for duplicate header names and issue warnings. The pod's header
+  // search path is recursive, so a header name present twice is ambiguous
+  // for a bare #include "Name.h" (#3209). Skia includes its own headers by
+  // their full path, so the pairs it ships are fine as long as the wrapper
+  // includes them by path too.
+  const knownDuplicateHeaders = [
+    // include/cpu/Recorder.h (skcpu::Recorder, included by Graphite's
+    // Recorder.h since m157) and include/gpu/graphite/Recorder.h.
+    "Recorder.h",
+  ];
+  const duplicateHeaders = $(
+    "find ./cpp -name '*.h' -type f | sed 's/.*\\///' | sort | uniq -d"
+  )
+    .toString()
+    .split("\n")
+    .filter((name: string) => name && !knownDuplicateHeaders.includes(name))
+    .join("\n");
+  if (duplicateHeaders.trim()) {
+    console.warn("⚠️  WARNING: Found duplicate header names:");
+    duplicateHeaders
+      .split("\n")
+      .filter(Boolean)
+      .forEach((filename: string) => {
+        const fullPaths = $(
+          `find ./cpp -name "${filename}" -type f`
+        ).toString();
+        console.warn(`   ${filename}:`);
+        fullPaths
+          .split("\n")
+          .filter(Boolean)
+          .forEach((filePath: string) => {
+            console.warn(`     ${filePath}`);
+          });
+      });
+    console.error(
+      "❌ ERROR: Duplicate headers found that will cause iOS build conflicts!"
+    );
+    process.exit(1);
+  }
+  applyPatchesToHeaders();
+  console.log("✅ Skia headers copied to ./cpp/skia");
+};
+
+// build-skia applies scripts/skia-*.patch to the Skia checkout before it
+// compiles, so the prebuilt binaries are built from patched headers. The
+// copies above come from the unpatched submodule: apply the hunks of the
+// patches that touch a copied file, or the wrapper compiles against
+// declarations the binaries do not define (e.g. the SkSurfaceProps argument
+// of Recorder::makeDeferredCanvas, an undefined symbol at link time).
+const applyPatchesToHeaders = () => {
+  const copiedRoot = path.join(PackageRoot, "cpp/skia");
+  const patches = fs
+    .readdirSync(__dirname)
+    .filter((f) => f.startsWith("skia-") && f.endsWith(".patch"))
+    .sort();
+  for (const name of patches) {
+    const sections = fs
+      .readFileSync(path.join(__dirname, name), "utf-8")
+      .split(/^(?=diff --git )/m)
+      .filter((section) => {
+        const target = section.match(/^diff --git a\/\S+ b\/(\S+)/)?.[1];
+        return target && fs.existsSync(path.join(copiedRoot, target));
+      });
+    if (sections.length === 0) {
+      continue;
+    }
+    const filtered = path.join(copiedRoot, `.${name}`);
+    fs.writeFileSync(filtered, sections.join(""));
+    try {
+      // Inside this repository, git apply silently skips paths outside the
+      // current directory and the ignored cpp/skia. Stopping repository
+      // discovery at cpp/skia makes it patch the files there like `patch -p1`.
+      execSync(`git apply ${filtered}`, {
+        cwd: copiedRoot,
+        env: {
+          ...process.env,
+          GIT_CEILING_DIRECTORIES: path.dirname(copiedRoot),
+        },
+        stdio: "inherit",
+      });
+    } finally {
+      fs.rmSync(filtered);
+    }
+    console.log(`   🩹 ${name} applied to the copied headers`);
+  }
+};

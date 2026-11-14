@@ -1,0 +1,105 @@
+import type { CanvasKit, Image } from "canvaskit-wasm";
+
+import type {
+  SkData,
+  ImageInfo,
+  SkImage,
+  ImageFactory,
+  GPUTextureHandle,
+} from "../types";
+
+import { Host, getEnum, throwNotImplementedOnRNWeb } from "./Host";
+import { JsiSkImage } from "./JsiSkImage";
+import { JsiSkData } from "./JsiSkData";
+import type { JsiSkSurface } from "./JsiSkSurface";
+
+// The video element of a playing video, an ImageBitmap, a canvas...
+const isCanvasImageSource = (buffer: unknown): buffer is CanvasImageSource =>
+  buffer instanceof HTMLVideoElement ||
+  buffer instanceof HTMLCanvasElement ||
+  buffer instanceof ImageBitmap ||
+  buffer instanceof OffscreenCanvas ||
+  (typeof VideoFrame !== "undefined" && buffer instanceof VideoFrame) ||
+  buffer instanceof HTMLImageElement ||
+  buffer instanceof SVGImageElement;
+
+export class JsiSkImageFactory extends Host implements ImageFactory {
+  constructor(CanvasKit: CanvasKit) {
+    super(CanvasKit);
+  }
+
+  MakeNull() {
+    return new JsiSkImage(this.CanvasKit, null as unknown as Image);
+  }
+
+  MakeFromNativeBuffer(
+    buffer: CanvasImageSource,
+    surface?: JsiSkSurface,
+    image?: JsiSkImage
+  ) {
+    if (!isCanvasImageSource(buffer)) {
+      throw new Error("MakeFromNativeBuffer expects a CanvasImageSource");
+    }
+    if (!surface) {
+      let img: Image;
+      if (
+        buffer instanceof HTMLImageElement ||
+        buffer instanceof HTMLVideoElement ||
+        buffer instanceof ImageBitmap
+      ) {
+        img = this.CanvasKit.MakeLazyImageFromTextureSource(buffer);
+      } else {
+        img = this.CanvasKit.MakeImageFromCanvasImageSource(buffer);
+      }
+      return new JsiSkImage(this.CanvasKit, img);
+    } else if (!image) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const img = (surface as any).makeImageFromTextureSource(buffer) as Image;
+      return new JsiSkImage(this.CanvasKit, img);
+    } else {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const img = (surface as any).updateTextureFromSource(
+        image,
+        buffer
+      ) as Image;
+      return new JsiSkImage(this.CanvasKit, img);
+    }
+  }
+
+  MakeFromEncoded(encoded: SkData) {
+    const image = this.CanvasKit.MakeImageFromEncoded(
+      JsiSkData.fromValue(encoded)
+    );
+    if (image === null) {
+      return null;
+    }
+    return new JsiSkImage(this.CanvasKit, image);
+  }
+
+  MakeRaster(info: ImageInfo, data: SkData, bytesPerRow: number) {
+    // see toSkImageInfo() from canvaskit
+    const image = this.CanvasKit.MakeImage(
+      {
+        alphaType: getEnum(this.CanvasKit, "AlphaType", info.alphaType),
+        colorSpace: this.CanvasKit.ColorSpace.SRGB,
+        colorType: getEnum(this.CanvasKit, "ColorType", info.colorType),
+        height: info.height,
+        width: info.width,
+      },
+      JsiSkData.fromValue(data),
+      bytesPerRow
+    );
+    if (image === null) {
+      return null;
+    }
+    return new JsiSkImage(this.CanvasKit, image);
+  }
+
+  MakeFromGPUTexture(_texture: GPUTextureHandle): SkImage {
+    return throwNotImplementedOnRNWeb<SkImage>();
+  }
+
+  MakeGPUTextureFromImage(_image: SkImage): bigint {
+    return throwNotImplementedOnRNWeb<bigint>();
+  }
+}

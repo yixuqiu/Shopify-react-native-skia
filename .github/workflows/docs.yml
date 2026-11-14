@@ -1,39 +1,51 @@
 name: Deploy Documentation
 
 on:
+  # Run by hand for documentation-only changes.
   workflow_dispatch:
     branches:
       - main
+  # Called by the release workflow after a release from main.
+  workflow_call:
 
 jobs:
   build_and_deploy_docs:
+    if: ${{ contains(fromJSON('["shopify/react-native-skia", "wcandillon/react-native-skia"]'), github.repository) }}
     runs-on: ubuntu-latest
-    env:
-      WORKING_DIRECTORY: ./
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
         with:
           submodules: recursive
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          cache: yarn
-
-      - name: Install dependencies
-        run: yarn bootstrap
-
-      - name: Build Documentation
-        run: |
-          cd docs
-          yarn install
-          yarn build
-
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+      - name: Setup
+        uses: ./.github/actions/setup
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs/build
+
+      # The setup already installed the whole workspace, apps/docs included.
+      - name: Build Documentation
+        working-directory: apps/docs
+        run: yarn build
+
+      - name: Include frozen v2 documentation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          ref: docs-v2
+          path: apps/docs/build/v2
+
+      - name: Remove v2 checkout metadata
+        run: rm -rf apps/docs/build/v2/.git
+
+      # shopify.github.io only serves redirects to the docs hosted on wcandillon.github.io
+      - name: Replace site with redirects
+        if: ${{ github.repository_owner == 'shopify' }}
+        run: node apps/docs/scripts/redirect-site.mjs apps/docs/build https://wcandillon.github.io
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./apps/docs/build
           user_name: github-actions[bot]
           user_email: 41898282+github-actions[bot]@users.noreply.github.com

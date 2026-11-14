@@ -1,0 +1,809 @@
+name: CI
+# Pushes to main/next only run the cheap ubuntu jobs (lint, test, test-web,
+# build-library), the Android build (with its emulator run on main only), the
+# SwiftPM build, and (on main only) the macOS build. The native builds and
+# the emulator/simulator runs happen on pull requests and in the merge queue,
+# so a merge does not pay for the full suite twice. The Android build runs on
+# push because a pull request can only restore caches saved by its own
+# earlier runs or by its base branch (see build-test-android). The SwiftPM
+# build runs on push, and on the pull requests whose diff can affect it (see
+# spm-changes).
+on:
+  push:
+    branches:
+      - main
+      - next
+  pull_request:
+    branches:
+      - main
+      - next
+  merge_group:
+    types:
+      - checks_requested
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - run: pip install cpplint
+      - run: cpplint --linelength=230 --filter=-legal/copyright,-whitespace/indent,-whitespace/comments,-whitespace/ending_newline,-build/include_order,-runtime/references,-readability/todo,-whitespace/blank_line,-whitespace/todo,-runtime/int,-build/c++11,-whitespace/parens,-build/include_what_you_use --exclude=packages/skia/cpp/skia --exclude=packages/skia/cpp/dawn --recursive packages/skia/cpp packages/skia/android/cpp
+
+      - name: Lint files
+        run: yarn lint:ci
+
+      - name: Typecheck files
+        run: yarn tsc
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test
+        run: yarn test
+
+      # Builds against the headers the Setup step copies, no Skia binaries.
+      - name: Test the C++ helpers
+        working-directory: packages/skia
+        run: yarn test-cpp
+
+  test-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Playwright Chromium
+        run: yarn playwright install --with-deps chromium
+
+      - name: Run web example tests
+        run: yarn test:web
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        with:
+          name: web-example-screenshots
+          path: apps/example/e2e/screenshots/
+          if-no-files-found: ignore
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        with:
+          name: web-example-test-results
+          path: apps/example/test-results/
+          if-no-files-found: ignore
+
+  build-library:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build package
+        run: yarn build
+
+      - name: Build dry run release
+        working-directory: packages/skia
+        run: |
+          npx semantic-release --dry-run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # On pull requests and in the merge queue this builds the example app and
+  # runs the e2e suite on the emulator. On push it saves the Gradle cache and
+  # the ccache on the base branch, where every pull request can restore them,
+  # and on main it also runs the emulator suite, so main itself has Android
+  # e2e coverage; on next it stops after the build. Without that producer
+  # each pull request started cold (0 ccache hits, 28 minutes of C++) and saved
+  # its own 1.8 GB Gradle cache, which kept the repository above its 10 GB
+  # cache limit and evicted every entry within hours.
+  build-test-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          # Keep the swap file: the Graphite C++ build peaks close to the
+          # runner's 16 GB and the swap is the only headroom left.
+          swap-storage: false
+
+      - name: Install JDK
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Install NDK
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        id: setup-ndk
+        with:
+          ndk-version: r27d
+
+      - name: Set ANDROID_NDK
+        run: echo "ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK tools
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/emulator" >> $GITHUB_PATH
+
+      - name: Finalize Android SDK
+        run: |
+          /bin/bash -c "yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null"
+
+      - name: Install Android SDK
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > $GITHUB_WORKSPACE/apps/example/android/local.properties
+
+      - name: Cache Gradle
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('./apps/example/android/gradle/wrapper/gradle-wrapper.properties', 'yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # Compiler cache for the C++ builds (this library, React Native and the
+      # other native modules). CMake reads the launcher from the environment,
+      # which Gradle passes on to it, so build.gradle needs no change; turbo
+      # runs tasks in strict env mode, so turbo.json lists the launcher, the
+      # CCACHE_* settings and the architecture property, or none of them would
+      # reach the build (they did not until then: every ABI was built and the
+      # compiler check fell back to mtime, which the NDK reinstall defeats). Most
+      # pull requests touch little C++, and a hit turns the compile into a
+      # copy. The key is unique per run: the cache is a rolling one, always
+      # saved, and restored from the most recent run on this ref or on the
+      # base branch (the push runs keep the base branch's entry fresh). The
+      # compiler check is on the binary's content rather than its mtime
+      # because the NDK is reinstalled on every run.
+      - name: Install ccache
+        run: sudo apt-get install -y ccache
+
+      - name: Restore ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-android-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-android-
+
+      - name: Build example for Android
+        env:
+          JAVA_OPTS: "-XX:MaxHeapSize=6g"
+          # Only the emulator ABI is tested below, so skip the other three.
+          ORG_GRADLE_PROJECT_reactNativeArchitectures: x86_64
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPILERCHECK: content
+        run: |
+          ccache --zero-stats
+          yarn turbo run build:android --concurrency 1
+          ccache --show-stats
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-android-${{ github.sha }}
+
+      # Everything below is the emulator run, skipped on pushes other than to
+      # main (see the job comment).
+      - name: Unit test the Android library
+        if: (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        working-directory: apps/example/android
+        env:
+          ORG_GRADLE_PROJECT_reactNativeArchitectures: x86_64
+        run: ./gradlew :react-native-skia:testDebugUnitTest
+
+      - name: Upload Android APK artifact
+        if: (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        with:
+          name: android-example-apk
+          path: apps/example/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Enable KVM group perms
+        if: (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # CI=true is inlined into the bundle and opens the app on the Tests
+      # screen. The background bundle request warms Metro's transform cache
+      # while the emulator boots, so the app's own first request is served in
+      # seconds instead of minutes.
+      - name: Start Package Manager
+        if: (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        working-directory: apps/example/
+        run: |
+          E2E=true yarn start &
+          (sleep 10 && curl -sf --retry 12 --retry-connrefused --retry-delay 5 -o /dev/null "http://localhost:8081/index.bundle?platform=android&dev=true&minify=false") &
+
+      # The runner has no GPU: the guest sees SwiftShader's Vulkan 1.3 device
+      # through gfxstream and Graphite renders through Dawn on it. The image
+      # has to be API 34 or newer: on API 30 the guest Vulkan driver fails to
+      # map its host-visible memory (goldfish-address-space errno 1) and the
+      # app crashes on the first mapped buffer (react-native-webgpu#505).
+      #
+      # The whole e2e suite, as the iOS job does. `yarn e2e` sets E2E=true,
+      # which is what makes the tests run on the emulator: without it the
+      # harness uses CanvasKit in Node and never talks to the app. Paragraphs
+      # stays excluded, as it was before the Graphite switch. ClippedSubviews
+      # is excluded on the emulator only, where it is flaky; it still runs on
+      # iOS and on a physical Android device.
+      - name: Run Android Emulator Tests
+        if: (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: Nexus 5X
+          force-avd-creation: true
+          emulator-options: -no-snapshot-save -no-window -gpu swangle_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          # The action runs each script line in its own shell, hence the
+          # detached logcat capture. The app reaches Metro and the test server
+          # at localhost (useClient), which inside the emulator is the guest:
+          # Metro is reversed here, the test server port by the jest
+          # globalSetup, the same as for a phone.
+          script: |
+            adb reverse tcp:8081 tcp:8081
+            nohup adb logcat > logcat.txt 2>&1 &
+            # Right after "Emulator booted" adb can still answer "device offline" for a moment, so wait and retry the install.
+            ok=0; for i in 1 2 3 4 5; do adb wait-for-device install -r apps/example/android/app/build/outputs/apk/debug/app-debug.apk && ok=1 && break; echo "adb install failed (attempt $i)"; sleep 5; done; [ "$ok" = 1 ]
+            adb wait-for-device shell monkey -p com.reactnativeskia.example 1
+            cd packages/skia && CI=true yarn e2e --testPathIgnorePatterns "Paragraphs|ClippedSubviews"
+
+      # The *.test.png images of failed checks: a failed comparison's, and
+      # the image of a check without a reference.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        if: always() && (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        with:
+          path: packages/skia/src/__tests__/snapshots/**/*.test.png
+          name: tests-snapshots-screenshots
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        if: always() && (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        with:
+          path: logcat.txt
+          name: android-logcat
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        if: failure() && (github.event_name != 'push' || github.ref == 'refs/heads/main')
+        with:
+          path: apps/docs/static/
+          name: tests-docs-screenshots
+
+  # Builds the example app for arm64 and runs the e2e suite on the Pixel 8
+  # plugged into the self-hosted Mac. The emulator in build-test-android
+  # renders through SwiftShader; this runs Graphite on a real Mali GPU and
+  # Vulkan driver, which is where the device-specific bugs live. Pushes run
+  # it on main only, as for the emulator.
+  #
+  # It runs on its own runner listener (label `android-device`), so it does
+  # not queue behind build-test-ios on the Mac, and only one job at a time
+  # ever drives the phone. Its ports are in build-test-ios's table.
+  #
+  # The phone must have no secure lock screen (Settings > Security > Screen
+  # lock > None) and USB debugging authorized for the runner user's adb key.
+  # If more than one device is attached, set ANDROID_SERIAL in the
+  # listener's .env file.
+  build-test-android-device:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, android-device]
+    timeout-minutes: 60
+    env:
+      METRO_PORT: 8086
+      E2E_PORT: 4247
+      APP_ID: com.reactnativeskia.example
+      # Only the phone's ABI.
+      ORG_GRADLE_PROJECT_reactNativeArchitectures: arm64-v8a
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install JDK
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Install NDK
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        id: setup-ndk
+        with:
+          ndk-version: r27d
+
+      # The SDK is installed once on the machine (the same lookup as the
+      # react-native-webgpu workflow). Gradle downloads missing platforms and
+      # build tools into it on first use.
+      - name: Set up Android SDK
+        run: |
+          echo "ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          if [ -z "$ANDROID_HOME" ] || [ ! -d "$ANDROID_HOME" ]; then
+            for candidate in "$HOME/Library/Android/sdk" "$HOME/android-sdk" \
+              /opt/homebrew/share/android-commandlinetools; do
+              if [ -d "$candidate" ]; then ANDROID_HOME=$candidate; break; fi
+            done
+          fi
+          if [ ! -d "$ANDROID_HOME/platform-tools" ]; then
+            echo "::error::No Android SDK with platform-tools found on the runner"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "sdk.dir=$ANDROID_HOME" > apps/example/android/local.properties
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          fi
+
+      # Fail in seconds, with a readable message, when the phone is missing,
+      # unauthorized or one of several devices.
+      - name: Check the device
+        run: |
+          adb start-server
+          adb devices -l
+          if [ -z "$ANDROID_SERIAL" ]; then
+            SERIALS=$(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')
+            if [ "$(echo "$SERIALS" | grep -c .)" != 1 ]; then
+              echo "::error::Expected exactly one authorized device, found: ${SERIALS:-none}. Set ANDROID_SERIAL in the runner's .env."
+              exit 1
+            fi
+            ANDROID_SERIAL=$SERIALS
+          fi
+          echo "ANDROID_SERIAL=$ANDROID_SERIAL" >> "$GITHUB_ENV"
+          echo "Using $(adb -s "$ANDROID_SERIAL" shell getprop ro.product.model) ($ANDROID_SERIAL), Android $(adb -s "$ANDROID_SERIAL" shell getprop ro.build.version.release)"
+
+      # The machine is persistent: ~/.gradle and the ccache directory survive
+      # between runs on disk, so neither goes through GitHub's cache. ccache
+      # is used when it is installed (brew install ccache).
+      - name: Build example for Android
+        run: |
+          if command -v ccache > /dev/null; then
+            export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            export CCACHE_DIR="$HOME/.cache/ccache-skia-android" CCACHE_MAXSIZE=10G CCACHE_COMPILERCHECK=content
+            ccache --zero-stats
+          fi
+          yarn turbo run build:android --concurrency 1
+          if command -v ccache > /dev/null; then ccache --show-stats; fi
+
+      - name: Ensure Metro and test server ports are free
+        run: |
+          lsof -ti tcp:$METRO_PORT -sTCP:LISTEN | xargs -r kill -9 || true
+          lsof -ti tcp:$E2E_PORT -sTCP:LISTEN | xargs -r kill -9 || true
+
+      # CI=true opens the app on the Tests screen; E2E_PORT is inlined into
+      # the bundle. --reset-cache because the transform cache in $TMPDIR
+      # outlives the run on this machine. The background request warms the
+      # bundle while the app installs.
+      - name: Start Package Manager
+        working-directory: apps/example
+        run: |
+          CI=true E2E=true yarn start --port $METRO_PORT --reset-cache > "$RUNNER_TEMP/metro.log" 2>&1 &
+          (sleep 10 && curl -sf --retry 30 --retry-connrefused --retry-delay 5 -o /dev/null "http://localhost:$METRO_PORT/index.bundle?platform=android&dev=true&minify=false") &
+
+      # Wake and unlock (works only without a secure lock screen), keep the
+      # screen on while plugged in for the duration of the run, turn the
+      # animations off, and never test a binary left by an earlier run. The
+      # app asks for Metro at its own localhost:8081, mapped here to this
+      # job's port; the test server port is reversed by the jest globalSetup.
+      - name: Prepare the device and install the app
+        run: |
+          adb shell input keyevent KEYCODE_WAKEUP
+          adb shell wm dismiss-keyguard
+          if [ "$(adb shell locksettings get-disabled | tr -d '\r')" != "true" ]; then
+            echo "::warning::The device has a secure lock screen: a reboot or a power button press will lock it and the run will time out. Set Screen lock to None."
+          fi
+          # `true` rather than `usb`: the phone reports its port as AC power.
+          adb shell svc power stayon true
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb uninstall "$APP_ID" || true
+          adb install -r apps/example/android/app/build/outputs/apk/debug/app-debug.apk
+          adb reverse tcp:8081 tcp:$METRO_PORT
+          adb logcat -c
+          nohup adb logcat -v time > "$RUNNER_TEMP/logcat.txt" 2>&1 &
+          echo $! > "$RUNNER_TEMP/logcat.pid"
+
+      # The app is launched fresh (just installed, so no instance from an
+      # earlier run can connect to this server first) and retries the
+      # socket until the test server is up. Paragraphs is excluded until the
+      # two RTL cases have -android reference images.
+      - name: Run e2e tests
+        run: |
+          adb shell monkey -p "$APP_ID" 1 > /dev/null
+          cd packages/skia
+          CI=true E2E_CONNECT_TIMEOUT=300 yarn e2e --testPathIgnorePatterns "Paragraphs"
+
+      - name: Screenshot the device
+        if: failure()
+        run: adb exec-out screencap -p > "$RUNNER_TEMP/screen.png" || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/logcat.pid" ] && kill "$(cat "$RUNNER_TEMP/logcat.pid")" || true
+          lsof -ti tcp:$METRO_PORT -sTCP:LISTEN | xargs -r kill -9 || true
+          lsof -ti tcp:$E2E_PORT -sTCP:LISTEN | xargs -r kill -9 || true
+          if [ -n "$ANDROID_SERIAL" ]; then
+            adb shell am force-stop "$APP_ID" || true
+            # Only this job's mappings: the test server's is removed by the
+            # jest globalTeardown, Metro's here.
+            adb reverse --remove tcp:8081 || true
+            adb reverse --remove tcp:$E2E_PORT || true
+            # Let the screen sleep between runs (an always-on OLED burns in).
+            adb shell svc power stayon false || true
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        if: always()
+        with:
+          name: android-device-snapshots
+          path: packages/skia/src/__tests__/snapshots/**/*.test.png
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        if: always()
+        with:
+          name: android-device-logs
+          path: |
+            ${{ runner.temp }}/logcat.txt
+            ${{ runner.temp }}/metro.log
+            ${{ runner.temp }}/screen.png
+          if-no-files-found: ignore
+
+  build-test-ios:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 90
+    env:
+      # Three repositories share this self-hosted machine. Each job runs on its
+      # own Metro port, test server port and simulator so they can run
+      # concurrently:
+      #   Metro  test server  simulator
+      #   8081   4242         (React Native defaults, used by redraw)
+      #   8082   4243         skia-ci     (this job)
+      #   8083   4244         webgpu-ci   (react-native-webgpu)
+      #   8084   4245         skia-agent  (agent.yml)
+      #   8086   4247         Pixel 8     (build-test-android-device)
+      # The app finds Metro through the RCT_jsLocation launch argument; E2E_PORT
+      # is inlined into the JS bundle (useClient) and read by the jest
+      # globalSetup, so the app and the test server agree on the port.
+      METRO_PORT: 8082
+      E2E_PORT: 4243
+      IOS_SIMULATOR: skia-ci
+      # Xcode's derived data, outside the workspace so it survives between
+      # runs (see the build step). One folder per job on the machine.
+      DERIVED_DATA: ${{ github.workspace }}/../derived-data/skia-ci-ios
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install CocoaPods
+        working-directory: apps/example/ios
+        run: pod install
+
+      # Clear anything a previous or cancelled run left on this job's ports.
+      - name: Ensure Metro and test server ports are free
+        run: |
+          lsof -ti :$METRO_PORT | xargs -r kill -9 || true
+          lsof -ti :$E2E_PORT | xargs -r kill -9 || true
+
+      # --reset-cache: Metro's transform cache lives in $TMPDIR and survives
+      # between runs on the self-hosted machine. A stale cache would serve JS
+      # built by an older Babel transform (e.g. a worklets version mismatch
+      # after a bump) or with a previously inlined E2E_PORT.
+      - name: Start Package Manager
+        working-directory: apps/example
+        run: E2E=true yarn start --port $METRO_PORT --reset-cache &
+
+      # A dedicated simulator, created once on the newest iOS runtime, so this
+      # job never shares a device with the other repositories on the machine.
+      - name: Prepare iOS simulator
+        run: |
+          UDID=$(xcrun simctl list devices available --json | jq -r --arg name "$IOS_SIMULATOR" '
+            .devices[] | .[] | select(.name == $name) | .udid' | head -n 1)
+          if [ -z "$UDID" ]; then
+            # Sorted numerically: the version is a string and simctl lists
+            # device types newest first, so a plain `last` is not the newest.
+            RUNTIME=$(xcrun simctl list runtimes available --json | jq -r '
+              .runtimes | map(select(.platform == "iOS"))
+              | sort_by(.version | split(".") | map(tonumber)) | last | .identifier')
+            DEVICE_TYPE=$(xcrun simctl list devicetypes --json | jq -r '
+              .devicetypes | map(select(.name | test("^iPhone [0-9]+ Pro$")))
+              | sort_by(.name | capture("^iPhone (?<n>[0-9]+) Pro$").n | tonumber) | last | .identifier')
+            echo "Creating $IOS_SIMULATOR ($DEVICE_TYPE, $RUNTIME)"
+            UDID=$(xcrun simctl create "$IOS_SIMULATOR" "$DEVICE_TYPE" "$RUNTIME")
+          fi
+          echo "Using simulator $IOS_SIMULATOR ($UDID)"
+          echo "IOS_SIMULATOR_UDID=$UDID" >> $GITHUB_ENV
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$UDID" -b
+          # Never test against a binary left over from a previous run.
+          xcrun simctl uninstall "$UDID" com.microsoft.ReactTestApp || true
+
+      # Plain xcodebuild rather than `yarn ios`: the CLI insists on opening
+      # Simulator.app from the Xcode bundle, which Xcode 27 no longer ships
+      # there, and a headless booted simulator is all the tests need.
+      # The derived data lives outside the workspace, which the checkout
+      # cleans on every run: kept there, the build is incremental and only
+      # the sources that changed since the previous run are compiled.
+      - name: Build example for iOS
+        working-directory: apps/example/ios
+        run: |
+          set -o pipefail && xcodebuild \
+            -workspace example.xcworkspace \
+            -scheme example \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "id=$IOS_SIMULATOR_UDID" \
+            -derivedDataPath "$DERIVED_DATA" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build | tee xcodebuild.log | xcpretty || {
+              # xcpretty drops some errors (e.g. project-level ones), so show
+              # them from the raw log.
+              grep -E "error:|fatal error" xcodebuild.log | sort -u | head -50
+              exit 1
+            }
+
+      # React Native's prebuilt core, which the example installs since 0.88, is
+      # compiled with Metro on 8081: an RCT_METRO_PORT build setting no longer
+      # reaches it.
+      # RCTBundleURLProvider reads the RCT_jsLocation user default first, and
+      # `-key value` launch arguments land in the user defaults.
+      - name: Install and launch app on simulator
+        run: |
+          xcrun simctl install "$IOS_SIMULATOR_UDID" "$DERIVED_DATA/Build/Products/Debug-iphonesimulator/ReactTestApp.app"
+          xcrun simctl launch "$IOS_SIMULATOR_UDID" com.microsoft.ReactTestApp \
+            -RCT_jsLocation "localhost:$METRO_PORT"
+
+      - name: Run e2e tests
+        working-directory: packages/skia
+        run: CI=true yarn e2e --testPathIgnorePatterns "Paragraph"
+
+      # The *.test.png images of failed checks, as the Android job uploads them.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6.0.0
+        if: always() && github.event_name != 'push'
+        with:
+          path: packages/skia/src/__tests__/snapshots/**/*.test.png
+          name: ios-tests-snapshots-screenshots
+          if-no-files-found: ignore
+
+      # Stop Metro and shut the simulator down so they don't hold memory
+      # while the machine runs the other repositories' jobs.
+      - name: Clean up
+        if: always()
+        run: |
+          lsof -ti :$METRO_PORT | xargs -r kill -9 || true
+          lsof -ti :$E2E_PORT | xargs -r kill -9 || true
+          if [ -n "$IOS_SIMULATOR_UDID" ]; then
+            xcrun simctl shutdown "$IOS_SIMULATOR_UDID" || true
+          fi
+
+  # Builds the example for macOS on pushes to main (and manual runs) only, on
+  # a hosted Mac so it never holds the self-hosted one. Pull requests and the
+  # merge queue skip it, which still satisfies the required check:
+  # build-test-ios already compiles the same Apple and C++ sources, and the
+  # apple-sdks workflow checks the platform-specific Apple code against the
+  # iOS, macOS and tvOS SDKs on every pull request that touches it. What only
+  # this job catches (a macOS link error, react-native-macos drift) shows up
+  # on main instead.
+  build-test-macos:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build example for macOS
+        run: yarn turbo run build:macos --concurrency 1
+
+  # Decides whether build-test-ios-spm runs. That job only proves that
+  # packages/skia/Package.swift resolves and compiles, so a pull request pays
+  # for it only when its diff touches what can change the outcome: the
+  # manifest and the autolinking config, the Apple and C++ sources it
+  # compiles, the scripts that copy the headers from the Skia submodule and
+  # the submodule itself, the dependencies that pin the prebuilt binaries,
+  # the example that links it, or CI itself. Pushes to main/next, the merge
+  # queue and manual runs build unconditionally: a change this list misses
+  # still shows up on main, and those runs save the node_modules cache the
+  # pull request runs restore (see .github/actions/setup).
+  spm-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.diff.outputs.run }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+
+      # The checkout is the pull request's merge commit at depth 1. Fetching
+      # the base commit by hash gives git both trees, which is all a diff
+      # needs, without the history in between.
+      - name: Compare the pull request to its base
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --depth=1 origin "$BASE"
+          changed=$(git diff --name-only "$BASE" HEAD)
+          run=false
+          while IFS= read -r file; do
+            case "$file" in
+              packages/skia/Package.swift|packages/skia/package.json|packages/skia/react-native.config.js|\
+              packages/skia/apple/*|packages/skia/cpp/*|packages/skia/scripts/*|\
+              spm-example/*|package.json|yarn.lock|.gitmodules|externals/*|\
+              .github/workflows/ci.yml|.github/actions/setup/*)
+                echo "$file"
+                run=true
+                ;;
+            esac
+          done <<< "$changed"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  # The SwiftPM example builds on a GitHub-hosted Mac. It needs no Metro,
+  # simulator or CocoaPods, so nothing ties it to the self-hosted machine, and
+  # a fresh runner is the strictest check that Package.swift finds the
+  # prebuilt Skia and Dawn packages next to the library with nothing cached.
+  # It used to run on the self-hosted Mac ahead of build-test-ios, which then
+  # waited for it, and a hung xcodebuild there held the one machine that runs
+  # the iOS and macOS checks.
+  build-test-ios-spm:
+    needs: spm-changes
+    if: needs.spm-changes.outputs.run == 'true'
+    runs-on: macos-latest
+    # Cold run: yarn install with the Skia and Dawn binaries, the React Native
+    # artifacts, then one xcodebuild.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+        with:
+          submodules: recursive
+
+      # Installs the workspace and copies the Skia, Graphite and Dawn headers.
+      # packages/skia/Package.swift resolves the prebuilt binaries
+      # (react-native-skia-graphite-apple-ios, react-native-webgpu-dawn) from
+      # the workspace's node_modules, not from spm-example's.
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # xcpretty is a gem, not part of the macOS runner image.
+      - name: Install xcpretty
+        run: command -v xcpretty >/dev/null || sudo gem install xcpretty --no-document
+
+      # spm-example sits outside the yarn workspace so its React Native can
+      # differ from the one apps/example pins. It ships no lockfile; react and
+      # react-native are pinned exactly in its package.json.
+      - name: Install spm-example dependencies
+        working-directory: spm-example
+        run: npm install
+
+      # The .xcodeproj is committed already injected, so this refreshes the
+      # injection, runs codegen and downloads the React Native artifacts. It
+      # exits 2 if a linked library ships no Package.swift.
+      - name: Set up Swift Package Manager
+        working-directory: spm-example/ios
+        run: npx react-native spm update
+
+      # No simulator is booted: a generic destination is enough to prove the
+      # package compiles and links.
+      - name: Build spm-example for iOS
+        working-directory: spm-example/ios
+        run: |
+          set -o pipefail && xcodebuild \
+            -project SpmExample.xcodeproj \
+            -scheme SpmExample \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath spm-build \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build | tee xcodebuild.log | xcpretty || {
+              # xcpretty drops some errors (e.g. project-level ones), so show
+              # them from the raw log.
+              grep -E "error:|fatal error" xcodebuild.log | sort -u | head -50
+              exit 1
+            }

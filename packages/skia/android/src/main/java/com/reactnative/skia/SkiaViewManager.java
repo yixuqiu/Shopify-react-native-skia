@@ -1,0 +1,97 @@
+package com.reactnative.skia;
+
+import com.facebook.react.uimanager.PointerEvents;
+import com.facebook.react.uimanager.ThemedReactContext;
+import com.facebook.react.uimanager.ViewProps;
+import com.facebook.react.uimanager.annotations.ReactProp;
+import com.facebook.react.viewmanagers.SkiaViewManagerDelegate;
+import com.facebook.react.viewmanagers.SkiaViewManagerInterface;
+import com.facebook.react.views.view.ReactViewGroup;
+import com.facebook.react.views.view.ReactViewManager;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+
+public class SkiaViewManager extends ReactViewManager implements SkiaViewManagerInterface<SkiaView> {
+
+    protected SkiaViewManagerDelegate mDelegate;
+
+    SkiaViewManager() {
+        mDelegate = new SkiaViewManagerDelegate(this);
+    }
+
+    protected SkiaViewManagerDelegate getDelegate() {
+        return mDelegate;
+    }
+
+    @NonNull
+    @Override
+    public String getName() {
+        return "SkiaView";
+    }
+
+    @NonNull
+    @Override
+    public SkiaView createViewInstance(@NonNull ThemedReactContext reactContext) {
+        return new SkiaView(reactContext);
+    }
+
+    @Override
+    public void setNativeId(@NonNull ReactViewGroup view, @Nullable String nativeId) {
+        super.setNativeId(view, nativeId);
+        int nativeIdResolved = Integer.parseInt(nativeId);
+        ((SkiaView) view).bindNativeId(nativeIdResolved);
+    }
+
+    @ReactProp(name = "highBitDepth")
+    public void setHighBitDepth(SkiaView view, boolean value) {
+        view.setHighBitDepth(value);
+    }
+
+    // Android renders in sRGB whatever the prop says (see
+    // JniSkiaView::attachWindow).
+    @ReactProp(name = "colorSpace")
+    public void setColorSpace(SkiaView view, @Nullable String value) {}
+
+    @ReactProp(name = "androidBackingView")
+    public void setAndroidBackingView(SkiaView view, @Nullable String value) {
+        view.setBackingView(value);
+    }
+
+    @ReactProp(name = "androidOpaque")
+    public void setAndroidOpaque(SkiaView view, boolean value) {
+        view.setOpaque(value);
+    }
+
+    @ReactProp(name = "androidZOrderOnTop")
+    public void setAndroidZOrderOnTop(SkiaView view, boolean value) {
+        view.setZOrderOnTop(value);
+    }
+
+    @ReactProp(name = "androidZOrderMediaOverlay")
+    public void setAndroidZOrderMediaOverlay(SkiaView view, boolean value) {
+        view.setZOrderMediaOverlay(value);
+    }
+
+    @ReactProp(name = ViewProps.POINTER_EVENTS)
+    public void setPointerEvents(SkiaView view, @Nullable String pointerEventsStr) {
+        view.setPointerEvents(PointerEvents.parsePointerEvents(pointerEventsStr));
+    }
+
+    // The backing view depends on several props (androidBackingView,
+    // androidOpaque, the z-order props, highBitDepth), so it is created after
+    // the first transaction, once every prop has arrived, and kept; later
+    // transactions only apply what the view takes in place (see
+    // SkiaView.updateView).
+    @Override
+    protected void onAfterUpdateTransaction(@NonNull ReactViewGroup view) {
+        super.onAfterUpdateTransaction(view);
+        ((SkiaView) view).updateView();
+    }
+
+    @Override
+    public void onDropViewInstance(@NonNull ReactViewGroup view) {
+        super.onDropViewInstance(view);
+        ((SkiaView) view).dropInstance();
+    }
+}

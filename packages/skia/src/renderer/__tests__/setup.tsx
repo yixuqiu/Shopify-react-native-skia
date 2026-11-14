@@ -1,0 +1,582 @@
+/* eslint-disable camelcase */
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import fs from "fs";
+import path from "path";
+
+import React from "react";
+import type { ReactNode } from "react";
+import type { WebSocketServer } from "ws";
+
+import type * as SkiaExports from "../../index";
+import { JsiSkApi } from "../../skia/web/JsiSkia";
+import { Group } from "../components";
+import type { SkImage, SkFont, Skia, SkCanvas } from "../../skia/types";
+import { AlphaType, ColorType, isPath } from "../../skia/types";
+import { E2E } from "../../__tests__/setup";
+import { LoadSkiaWeb } from "../../web/LoadSkiaWeb";
+import { SkiaSGRoot } from "../../sksg/Reconciler";
+import type { Node } from "../../sksg/Node";
+
+import { SkiaObject } from "./e2e/setup";
+import type { Channel } from "./e2e/setup/Channel";
+
+jest.setTimeout(180 * 1000);
+
+type TestOS = "ios" | "android" | "web" | "node" | "macos";
+
+declare global {
+  var testServer: WebSocketServer;
+  var testConnection: { channel: Channel | null };
+  var testOS: TestOS;
+}
+export let surface: TestingSurface;
+const assets = new Map<SkImage | SkFont, string>();
+export let images: {
+  oslo: SkImage;
+  skiaLogoPng: SkImage;
+  skiaLogoJpeg: SkImage;
+  mask: SkImage;
+};
+export let fonts: {
+  RobotoMedium: SkFont;
+  NotoColorEmoji: SkFont;
+  NotoSansSCRegular: SkFont;
+  UberMoveMediumMono: SkFont;
+  DinMedium: SkFont;
+  Amiri: SkFont;
+};
+
+export let dataAssets: {
+  NotoSansSCRegular: Uint8Array;
+  img_0: Uint8Array;
+  AvenirHeavy: Uint8Array;
+};
+
+beforeAll(async () => {
+  await LoadSkiaWeb();
+  const Skia = JsiSkApi(global.CanvasKit);
+  global.SkiaApi = Skia;
+  surface = E2E ? new RemoteSurface() : new LocalSurface();
+  const { fontSize } = surface;
+  const NotoSansSCRegular = loadFont(
+    "skia/__tests__/assets/NotoSansSC-Regular.otf",
+    fontSize
+  );
+  const NotoColorEmoji = loadFont(
+    "skia/__tests__/assets/NotoColorEmoji.ttf",
+    fontSize
+  );
+  const RobotoMedium = loadFont(
+    "skia/__tests__/assets/Roboto-Medium.ttf",
+    fontSize
+  );
+  const UberMoveMediumMono = loadFont(
+    "skia/__tests__/assets/UberMove-Medium_mono.ttf",
+    fontSize
+  );
+  const DinMedium = loadFont("skia/__tests__/assets/DIN-Medium.ttf", fontSize);
+  const Amiri = loadFont("skia/__tests__/assets/Amiri-Regular.ttf", fontSize);
+  const oslo = loadImage("skia/__tests__/assets/oslo.jpg");
+  const skiaLogoPng = loadImage("skia/__tests__/assets/skia_logo.png");
+  const skiaLogoJpeg = loadImage("skia/__tests__/assets/skia_logo_jpeg.jpg");
+  const mask = loadImage("skia/__tests__/assets/mask.png");
+  dataAssets = {
+    AvenirHeavy: resolveFile("skia/__tests__/assets/Avenir-Heavy.ttf"),
+    NotoSansSCRegular: resolveFile(
+      "skia/__tests__/assets/NotoSansSC-Regular.otf"
+    ),
+    img_0: resolveFile("skia/__tests__/assets/oslo.jpg"),
+  };
+  images = { oslo, skiaLogoPng, skiaLogoJpeg, mask };
+  fonts = {
+    RobotoMedium,
+    NotoColorEmoji,
+    NotoSansSCRegular,
+    UberMoveMediumMono,
+    DinMedium,
+    Amiri,
+  };
+  assets.set(mask, "mask");
+  assets.set(oslo, "oslo");
+  assets.set(RobotoMedium, "RobotoMedium");
+  assets.set(NotoColorEmoji, "NotoColorEmoji");
+  assets.set(NotoSansSCRegular, "NotoSansSCRegular");
+  assets.set(UberMoveMediumMono, "UberMoveMediumMono");
+  assets.set(DinMedium, "DinMedium");
+  assets.set(Amiri, "Amiri");
+  assets.set(skiaLogoPng, "skiaLogoPng");
+  assets.set(skiaLogoJpeg, "skiaLogoJpeg");
+});
+
+export const wait = (ms: number) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// A snapshot's colour pipeline can move a channel by a few units, so colours
+// are read as names rather than exact bytes.
+const classifyColor = (red: number, green: number, blue: number) => {
+  if (red < 60 && green > 200 && blue > 200) {
+    return "cyan";
+  }
+  if (red > 200 && green < 60 && blue < 60) {
+    return "red";
+  }
+  if (red < 60 && green < 60 && blue > 200) {
+    return "blue";
+  }
+  if (red < 60 && green > 200 && blue < 60) {
+    return "green";
+  }
+  return null;
+};
+
+export const nameColor = (pixel: ArrayLike<number> | null) => {
+  if (pixel === null) {
+    return "unreadable";
+  }
+  const [red, green, blue] = [pixel[0], pixel[1], pixel[2]];
+  return classifyColor(red, green, blue) ?? `rgb(${red}, ${green}, ${blue})`;
+};
+
+// Every pixel of a snapshot, as unpremultiplied RGBA bytes.
+export const readAllPixels = async (image: SkImage) => {
+  const pixels = await image.readPixels(0, 0, {
+    width: image.width(),
+    height: image.height(),
+    colorType: ColorType.RGBA_8888,
+    alphaType: AlphaType.Unpremul,
+  });
+  if (pixels === null) {
+    throw new Error("The snapshot has no readable pixels");
+  }
+  return pixels;
+};
+
+// The pixels of a screen snapshot in each colour it names.
+export const countColors = async (image: SkImage) => {
+  const pixels = await readAllPixels(image);
+  const counts = { cyan: 0, red: 0, blue: 0, green: 0 };
+  for (let i = 0; i < pixels.length; i += 4) {
+    const color = classifyColor(pixels[i], pixels[i + 1], pixels[i + 2]);
+    if (color !== null) {
+      counts[color]++;
+    }
+  }
+  return counts;
+};
+
+// The colour of the screen at a fraction of its width and of its height.
+export const readScreenColor = async (image: SkImage, fraction: number) =>
+  nameColor(
+    await image.readPixels(
+      Math.round(image.width() * fraction),
+      Math.round(image.height() * fraction),
+      {
+        width: 1,
+        height: 1,
+        colorType: ColorType.RGBA_8888,
+        alphaType: AlphaType.Unpremul,
+      }
+    )
+  );
+
+export const resolveFile = (uri: string) =>
+  fs.readFileSync(path.resolve(__dirname, `../../${uri}`));
+
+export const resolveFont = (uri: string) =>
+  Array.from(fs.readFileSync(path.resolve(__dirname, `../../${uri}`)));
+
+(global as any).fetch = jest.fn((uri: string) =>
+  Promise.resolve({
+    arrayBuffer: () => Promise.resolve(resolveFile(uri)),
+  })
+);
+
+export const testingFonts = {
+  //  Noto: [resolveFont("skia/__tests__/assets/NotoSansSC-Regular.otf")],
+  Roboto: [
+    resolveFont("skia/__tests__/assets/Roboto-Regular.ttf"),
+    resolveFont("skia/__tests__/assets/Roboto-BlackItalic.ttf"),
+  ],
+  //  NotoColorEmoji: [resolveFont("skia/__tests__/assets/NotoColorEmoji.ttf")],
+};
+
+export interface EmptyProps {}
+
+jest.mock("react-native", () => ({
+  PixelRatio: {
+    get(): number {
+      return 1;
+    },
+  },
+  Platform: { OS: "web" },
+  Image: {
+    resolveAssetSource: jest.fn,
+  },
+}));
+
+export const BirdGIF = resolveFile("skia/__tests__/assets/bird.gif").toString(
+  "base64"
+);
+
+export const loadImage = (uri: string) => {
+  const Skia = global.SkiaApi;
+  const image = Skia.Image.MakeFromEncoded(
+    Skia.Data.fromBytes(resolveFile(uri))
+  );
+  expect(image).toBeTruthy();
+  return image!;
+};
+
+export const loadFont = (uri: string, ftSize?: number) => {
+  const Skia = global.SkiaApi;
+  const tf = Skia.Typeface.MakeFromData(Skia.Data.fromBytes(resolveFile(uri)));
+  expect(tf).toBeTruthy();
+  return Skia.Font(tf!, ftSize ?? fontSize);
+};
+
+export const importSkia = (): typeof SkiaExports => {
+  //const core = require("../../skia/core");
+  const skia = require("../../skia");
+  const renderer = require("../../renderer");
+  const offscreen = require("../Offscreen");
+  const nodes = require("../../dom/nodes");
+  // TODO: to remove
+  const animation = require("../../animation");
+  return {
+    ...skia,
+    ...renderer,
+    ...animation,
+    ...offscreen,
+    ...nodes,
+  };
+};
+
+export const PIXEL_RATIO = 3;
+export const fontSize = 32 * PIXEL_RATIO;
+export const width = 256 * PIXEL_RATIO;
+export const height = 256 * PIXEL_RATIO;
+export const center = { x: width / 2, y: height / 2 };
+
+export const drawOnNode = async (element: ReactNode) => {
+  const { surface: ckSurface, draw, root } = await mountCanvas(element);
+  await draw();
+  root.unmount();
+  return ckSurface;
+};
+
+export const mountCanvas = async (element: ReactNode) => {
+  const Skia = global.SkiaApi;
+  expect(Skia).toBeDefined();
+  const ckSurface = Skia.Surface.MakeOffscreen(width, height)!;
+  expect(ckSurface).toBeDefined();
+  const canvas = ckSurface.getCanvas();
+
+  const root = new SkiaSGRoot(Skia);
+  return {
+    surface: ckSurface,
+    root,
+    render: async () => {
+      await root.render(element);
+    },
+    draw: async () => {
+      await root.render(element);
+      root.drawOnCanvas(canvas);
+    },
+  };
+};
+
+export const serialize = async (element: ReactNode) => {
+  const { root, render } = await mountCanvas(element);
+  await render();
+  const serialized = await serializeNode(root.sg);
+  return JSON.stringify(serialized);
+};
+
+interface SerializedProps {
+  [key: string]: any;
+}
+
+interface SerializedNode {
+  type: string;
+  props: SerializedProps;
+  children: SerializedNode[];
+}
+
+// Asynchronous: an image without an asset name is sent encoded, and encoding
+// is a promise.
+const serializeSkOjects = async (obj: any): Promise<any> => {
+  if (typeof obj === "function") {
+    return { __typename__: "Function", source: `${obj.toString()}` };
+  } else if (obj instanceof Float32Array) {
+    return { __typename__: "Float32Array", value: Array.from(obj) };
+  } else if (Array.isArray(obj)) {
+    // Font and image bytes come as arrays of millions of numbers: a promise
+    // per element would take minutes and gigabytes, so an array of
+    // primitives is passed through as is.
+    if (
+      obj.every(
+        (item) =>
+          item === null ||
+          (typeof item !== "object" && typeof item !== "function")
+      )
+    ) {
+      return obj;
+    }
+    return Promise.all(obj.map((item) => serializeSkOjects(item)));
+  } else if (obj && typeof obj === "object" && "__typename__" in obj) {
+    if (obj instanceof SkiaObject) {
+      const skObj: SkiaObject<EvalContext, any> = obj;
+      return {
+        __typename__: "SkiaObject",
+        source: skObj.source,
+        context: skObj.context,
+      };
+    } else if (obj.__typename__ === "Point") {
+      return { __typename__: "Point", x: obj.x, y: obj.y };
+    } else if (obj.__typename__ === "Paint") {
+      return { __typename__: "Paint", color: Array.from(obj.getColor()) };
+    } else if (obj.__typename__ === "Rect") {
+      return {
+        __typename__: "Rect",
+        x: obj.x,
+        y: obj.y,
+        width: obj.width,
+        height: obj.height,
+      };
+    } else if (obj.__typename__ === "RRect") {
+      return {
+        __typename__: "RRect",
+        x: obj.rect.x,
+        y: obj.rect.y,
+        width: obj.rect.width,
+        height: obj.rect.height,
+        rx: obj.rx,
+        ry: obj.ry,
+      };
+    } else if (isPath(obj)) {
+      return {
+        __typename__: "Path",
+        cmds: obj.toCmds(),
+      };
+    } else if (obj.__typename__ === "Image") {
+      const asset = assets.get(obj)!;
+      if (!asset) {
+        return {
+          __typename__: "RawImage",
+          data: await obj.encodeToBase64(),
+        };
+      }
+      return {
+        __typename__: "Image",
+        name: asset,
+      };
+    } else if (obj.__typename__ === "Font") {
+      return {
+        __typename__: "Font",
+        size: obj.getSize(),
+        name: assets.get(obj)!,
+      };
+    } else if (obj.__typename__ === "RuntimeEffect") {
+      return {
+        __typename__: "RuntimeEffect",
+        source: obj.source(),
+      };
+    } else if (obj.__typename__ === "SVG") {
+      return {
+        __typename__: "SVG",
+        source: obj.source(),
+      };
+    } else if (obj.__typename__ === "RSXform") {
+      return {
+        __typename__: "RSXform",
+        scos: obj.scos,
+        ssin: obj.ssin,
+        tx: obj.tx,
+        ty: obj.ty,
+      };
+    } else if (obj.__typename__ === "SkottieAnimation") {
+      if (!obj.source) {
+        throw new Error("SkottieAnimation must have a source");
+      }
+      return {
+        __typename__: "SkottieAnimation",
+        source: obj.source,
+        assets: obj.assets,
+      };
+    } else if (obj.__typename__ === "ImageFilter") {
+      if (!obj.source) {
+        throw new Error("ImageFilter must have a source");
+      }
+      return {
+        __typename__: "Function",
+        source: obj.source,
+      };
+    }
+  } else if (obj && typeof obj === "object") {
+    const result: Record<string, any> = {};
+    for (const key of Object.keys(obj)) {
+      result[key] = await serializeSkOjects(obj[key]);
+    }
+    return result;
+  }
+  return obj;
+};
+
+const serializeNode = async (node: Node<any>): Promise<SerializedNode> => {
+  const props: any = {};
+  const ogProps = node.props;
+  if (ogProps) {
+    for (const key of Object.keys(ogProps)) {
+      if (key !== "children") {
+        props[key] = await serializeSkOjects(ogProps[key]);
+      }
+    }
+  }
+  return {
+    type: node.type,
+    props,
+    children: await Promise.all(
+      node.children.map((child) => serializeNode(child))
+    ),
+  };
+};
+
+export type EvalContext = Record<string, any>;
+
+interface TestingSurface {
+  eval<Ctx extends EvalContext = EvalContext, R = any>(
+    fn: (Skia: Skia, ctx: Ctx) => R,
+    ctx?: Ctx
+  ): Promise<R>;
+  drawOffscreen<Ctx extends EvalContext, R>(
+    fn: (Skia: Skia, canvas: SkCanvas, ctx: Ctx) => R,
+    ctx?: Ctx
+  ): Promise<SkImage>;
+  draw(node: ReactNode): Promise<SkImage>;
+  screen(name: string): Promise<SkImage>;
+  width: number;
+  height: number;
+  fontSize: number;
+  OS: TestOS;
+}
+
+class LocalSurface implements TestingSurface {
+  readonly width = 256;
+  readonly height = 256;
+  readonly fontSize = 32;
+  readonly OS = "node";
+
+  eval<Ctx extends EvalContext, R>(
+    fn: (Skia: Skia, ctx: Ctx) => R,
+    ctx?: Ctx
+  ): Promise<R> {
+    return Promise.resolve(fn(global.SkiaApi, ctx ?? ({} as any)));
+  }
+
+  drawOffscreen<Ctx extends EvalContext>(
+    fn: (Skia: Skia, canvas: SkCanvas, ctx: Ctx) => void,
+    ctx?: Ctx
+  ): Promise<SkImage> {
+    const ckSurface = global.SkiaApi.Surface.MakeOffscreen(
+      this.width * PIXEL_RATIO,
+      this.height * PIXEL_RATIO
+    );
+    if (!ckSurface) {
+      throw new Error("Unable to create offscreen surface");
+    }
+    const canvas = ckSurface.getCanvas();
+    canvas.save();
+    canvas.scale(PIXEL_RATIO, PIXEL_RATIO);
+    fn(global.SkiaApi, canvas, ctx ?? ({} as any));
+    canvas.restore();
+    ckSurface.flush();
+    return Promise.resolve(ckSurface.makeImageSnapshot());
+  }
+
+  async draw(node: ReactNode): Promise<SkImage> {
+    const { surface: ckSurface, draw } = await mountCanvas(
+      <Group transform={[{ scale: PIXEL_RATIO }]}>{node}</Group>
+    );
+    await draw();
+    return Promise.resolve(ckSurface.makeImageSnapshot());
+  }
+
+  screen(_name: string): Promise<SkImage> {
+    throw new Error("screen() is not implemented on node");
+  }
+}
+
+export class RemoteSurface implements TestingSurface {
+  readonly width = 256;
+  readonly height = 256;
+  readonly fontSize = 32;
+  readonly OS = global.testOS;
+
+  async eval<Ctx extends EvalContext, R>(
+    fn: (Skia: Skia, ctx: Ctx) => any,
+    context?: Ctx
+  ): Promise<R> {
+    const ctx = await this.prepareContext(context);
+    return this.channel.call<R>("eval", { code: fn.toString(), ctx });
+  }
+
+  async drawOffscreen<Ctx extends EvalContext>(
+    fn: (Skia: Skia, canvas: SkCanvas, ctx: Ctx) => void,
+    context?: Ctx
+  ) {
+    const ctx = await this.prepareContext(context);
+    const code = `(Skia, ctx, size, scale) => {
+const surface = Skia.Surface.MakeOffscreen(size, size);
+if (!surface) {
+  throw new Error("Unable to create offscreen surface");
+}
+const canvas = surface.getCanvas();
+canvas.save();
+canvas.scale(scale, scale);
+(${fn.toString()})(Skia, canvas, ctx);
+canvas.restore();
+surface.flush();
+return surface.makeImageSnapshot().encodeToBase64();
+}`;
+    return decodeImage(await this.channel.call<string>("eval", { code, ctx }));
+  }
+
+  async draw(node: ReactNode) {
+    const tree = JSON.parse(await serialize(node));
+    return decodeImage(await this.channel.call<string>("draw", tree));
+  }
+
+  async screen(name: string) {
+    return decodeImage(await this.channel.call<string>("screen", { name }));
+  }
+
+  private get channel() {
+    const { channel } = global.testConnection;
+    if (channel === null) {
+      throw new Error("Client is not connected. Did you call init?");
+    }
+    return channel;
+  }
+
+  private async prepareContext<Ctx extends EvalContext>(
+    context?: Ctx
+  ): Promise<EvalContext> {
+    const ctx: EvalContext = {};
+    if (context) {
+      for (const key of Object.keys(context)) {
+        ctx[key] = await serializeSkOjects(context[key]);
+      }
+    }
+    return ctx;
+  }
+}
+
+// The app sends every image as a base64 PNG.
+const decodeImage = (base64: string) => {
+  const Skia = global.SkiaApi;
+  const image = Skia.Image.MakeFromEncoded(Skia.Data.fromBase64(base64));
+  if (image === null) {
+    throw new Error("Unable to decode image");
+  }
+  return image;
+};
